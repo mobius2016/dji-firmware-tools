@@ -142,18 +142,41 @@ class SerialBulkWrap():
 def find_correct_device(dev):
     # Ugly way of finding the correct bulk device.
     # I truly wish this would be simpler.
+    import usb.core
     import usb.util
+
+    def has_bulk_pair(intf):
+        has_in = False
+        has_out = False
+        for ep in intf:
+            if usb.util.endpoint_type(ep.bmAttributes) != usb.util.ENDPOINT_TYPE_BULK:
+                continue
+            direction = usb.util.endpoint_direction(ep.bEndpointAddress)
+            if direction == usb.util.ENDPOINT_IN:
+                has_in = True
+            elif direction == usb.util.ENDPOINT_OUT:
+                has_out = True
+        return has_in and has_out
 
     for d in dev:
         for cfg in d:
-            # see if we can get the interface description.
-            interface_description = usb.util.get_string(d, cfg.iConfiguration)
+            # Older DJI layouts expose a configuration string that names each
+            # composite function. Some modern devices can be enumerated through
+            # libusb-1.0 but do not expose string descriptors through the active
+            # Windows driver stack, so descriptor-based discovery is optional.
+            interface_description = None
+            try:
+                if cfg.iConfiguration:
+                    interface_description = usb.util.get_string(
+                      d, cfg.iConfiguration)
+            except (usb.core.USBError, ValueError):
+                interface_description = None
 
-            if "," in interface_description:
+            if interface_description and "," in interface_description:
                 # UAVs
-                # They may have multiple "bulk" intefaces (all with the same
+                # They may have multiple "bulk" interfaces (all with the same
                 # bInterfaceSubClass), so we need to look for the "ACM" one
-                # (which is the DUML BULK interface)
+                # (which is the DUML BULK interface).
                 interface_descriptions = interface_description.split(",")
                 try:
                     interface_for_acm = interface_descriptions.index("acm") + 1
@@ -163,37 +186,42 @@ def find_correct_device(dev):
                 print("using bInterfaceNumber %d" % interface_for_acm)
                 for intf in cfg:
                     if intf.bInterfaceNumber == interface_for_acm:
-                        assert intf.bInterfaceSubClass == 0x43, "we expect the ACM inteface to be of the right bInterfaceSubclass"
+                        assert intf.bInterfaceSubClass == 0x43, (
+                          "we expect the ACM interface to be of the right "
+                          "bInterfaceSubclass")
                         return intf
-            elif "_" in interface_description:
 
+            elif interface_description and "_" in interface_description:
                 # RM330: "mtp_bulk_adb"
                 #   Interface 0: mtp
                 #   Interface 1: bulk
                 #   Interface 2: adb
-
-                # but:
-                # RM510: "mtp_bulk_adb"
-                #   Interface 0: bulk
-                #   Interface 1: mtp
-                #   Interface 2: adb
-
-                # So we resort to look for a bulk interface based on subclass.
-                # (Same strategy doesn't work on e.g. wm260 because they
-                # have multiple bulk interfaces with the same subclass.)
-
+                #
+                # RM510 uses the same description but a different ordering, so
+                # this family is selected by subclass instead of position.
                 interface_descriptions = interface_description.split("_")
                 if "bulk" in interface_descriptions:
-                    interface_for_acm = interface_descriptions.index("bulk")
                     for intf in cfg:
-                        if intf.bInterfaceSubClass == 0x43:
+                        if intf.bInterfaceSubClass == 0x43 and has_bulk_pair(intf):
                             return intf
                 else:
                     print("no BULK interface here.")
                     continue
-            else:
-                print("can't parse", interface_descriptions)
-                continue
+
+            elif d.idVendor == 0x2ca3 and d.idProduct == 0x0020:
+                # Air 3 (observed VID:PID 2ca3:0020): libusb-1.0 can enumerate
+                # the composite interfaces even when Windows does not expose
+                # configuration strings. DUML traffic is carried by interface 4,
+                # which has the expected DJI subclass and a bulk IN/OUT pair.
+                for intf in cfg:
+                    if (intf.bInterfaceNumber == 4
+                            and intf.bInterfaceSubClass == 0x43
+                            and has_bulk_pair(intf)):
+                        print("using bInterfaceNumber 4 (Air 3 DUML bulk)")
+                        return intf
+
+            elif interface_description:
+                print("can't parse", interface_description)
 
     return None
 
