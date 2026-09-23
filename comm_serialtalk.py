@@ -198,60 +198,80 @@ def find_correct_device(dev):
     return None
 
 
-LIBUSB_WIN32_DOWNLOAD_URL = (
-  "https://sourceforge.net/projects/libusb-win32/files/"
-  "libusb-win32-releases/1.4.0.2/"
-)
-
-
 def find_usb_devices(libusb_path=None):
-    """Preserve system backend selection, with an optional local Windows DLL."""
+    """Find DJI USB devices using packaged libusb1, system libusb1, then libusb0."""
     import usb.core
-    import usb.backend.libusb0 as myusb
+    import usb.backend.libusb1 as libusb1
+    import usb.backend.libusb0 as libusb0
 
-    attempted_path = None
+    def find_with_backend(backend):
+        if backend is None:
+            return None
+        return list(usb.core.find(
+          idVendor=0x2ca3, find_all=True, backend=backend))
+
     if libusb_path:
         attempted_path = os.path.abspath(libusb_path)
-        mybackend = myusb.get_backend(
-          find_library=lambda _: attempted_path)
-        if mybackend is not None:
-            return usb.core.find(idVendor=0x2ca3, find_all=True, backend=mybackend)
-    else:
-        # Upstream prefers libusb0, but backend=None lets PyUSB select another
-        # available backend. Do not turn a missing libusb0 into a fatal error.
-        mybackend = myusb.get_backend()
-        try:
-            return usb.core.find(idVendor=0x2ca3, find_all=True, backend=mybackend)
-        except usb.core.NoBackendError:
-            pass
 
-        if sys.platform == 'win32':
-            attempted_path = os.path.join(
-              os.path.dirname(os.path.abspath(__file__)), 'libusb0.dll')
-            if os.path.isfile(attempted_path):
-                mybackend = myusb.get_backend(
-                  find_library=lambda _: attempted_path)
-                if mybackend is not None:
-                    return usb.core.find(
-                      idVendor=0x2ca3, find_all=True, backend=mybackend)
+        # An explicit path is authoritative. Try libusb-1.0 first, then
+        # libusb-0.1 for backwards compatibility with existing callers.
+        for backend_module in (libusb1, libusb0):
+            backend = backend_module.get_backend(
+              find_library=lambda _: attempted_path)
+            if backend is not None:
+                return find_with_backend(backend)
 
-    message = "No backend available for USB bulk mode."
-    if attempted_path:
-        message += "\nCould not load '{}'; Python is {}-bit.".format(
-          attempted_path, sizeof(c_void_p) * 8)
-    if sys.platform == 'win32':
-        message += (
-          "\nInstall a compatible USB backend, or place libusb0.dll matching "
-          "Python's architecture beside comm_serialtalk.py (project root). "
-          "Use --libusb-path to select a libusb-0.1 library explicitly."
-          "\nTested Windows binaries: {}".format(LIBUSB_WIN32_DOWNLOAD_URL))
+        message = (
+          "No backend available for USB bulk mode.\n"
+          "Could not load '{}'; Python is {}-bit."
+        ).format(attempted_path, sizeof(c_void_p) * 8)
+        raise usb.core.NoBackendError(message)
+
+    backend_available = False
+
+    # Prefer libusb-package when installed. It carries a libusb-1.0 shared
+    # library and avoids requiring users to locate platform-specific DLLs.
+    try:
+        import libusb_package
+    except ImportError:
+        pass
     else:
-        message += (
-          "\nInstall a PyUSB-compatible native libusb library using your "
-          "system package manager, or select a libusb-0.1 library with "
-          "--libusb-path.")
+        backend = libusb_package.get_libusb1_backend()
+        if backend is not None:
+            backend_available = True
+            devices = find_with_backend(backend)
+            if devices:
+                return devices
+
+    # Preserve normal system-library operation on platforms where libusb is
+    # already installed independently of Python.
+    backend = libusb1.get_backend()
+    if backend is not None:
+        backend_available = True
+        devices = find_with_backend(backend)
+        if devices:
+            return devices
+
+    # Legacy fallback for systems already configured with libusb-0.1.
+    backend = libusb0.get_backend()
+    if backend is not None:
+        backend_available = True
+        devices = find_with_backend(backend)
+        if devices:
+            return devices
+
+    if backend_available:
+        # A backend loaded successfully, but no DJI device was visible.
+        return []
+
+    message = (
+      "No backend available for USB bulk mode.\n"
+      "Install the Python-packaged libusb backend with:\n"
+      "  python -m pip install libusb-package\n"
+      "Alternatively install a system libusb library or select one explicitly "
+      "with --libusb-path."
+    )
     raise usb.core.NoBackendError(message)
-
 
 def open_usb(po):
     import usb.core
@@ -463,7 +483,7 @@ def main():
             help="use usb bulk instead of serial connection")
 
     parser.add_argument('--libusb-path', type=str,
-            help="path to a libusb-0.1 compatible library for USB bulk mode")
+            help="path to a libusb shared library for USB bulk mode")
 
     parser.add_argument('-b', '--baudrate', default=9600, type=int,
             help="the baudrate to use for the serial port (default is %(default)s)")
